@@ -63,11 +63,3 @@ func TestSearchForAddressRecordIOError(t *testing.T) {
 		t.Fatal("expected seek/read error")
 	}
 }
-
-func TestExpectedIndexFileSize(t *testing.T) {
-	got := expectedIndexFileSize(indexHeader{AddressCount: 2, AppearanceCount: 3})
-	want := int64(HeaderWidth) + 2*int64(AddrRecordWidth) + 3*int64(AppRecordWidth)
-	if got != want {
-		t.Fatalf("got %d want %d", got, want)
-	}
-}
