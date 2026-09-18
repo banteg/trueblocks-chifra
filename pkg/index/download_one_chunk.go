@@ -37,21 +37,26 @@ func DownloadOneChunk(chain string, man *manifest.Manifest, fileRange ranges.Fil
 		close(progressChannel)
 	}()
 
+	var firstErr error
 	for event := range progressChannel {
 		switch event.Event {
 		case progress.AllDone:
-			return nil
+			// completed normally
 		case progress.Cancelled:
-			return ErrUserHitControlC
+			if firstErr == nil {
+				firstErr = ErrUserHitControlC
+			}
 		case progress.Error:
-			if event.Error != nil {
-				return fmt.Errorf("error while downloading: %w", event.Error)
+			if firstErr == nil {
+				if event.Error != nil {
+					firstErr = fmt.Errorf("error while downloading: %w", event.Error)
+				} else if event.Message != "" {
+					firstErr = fmt.Errorf("error while downloading: %s", event.Message)
+				} else {
+					firstErr = fmt.Errorf("error while downloading")
+				}
 			}
-			if event.Message != "" {
-				return fmt.Errorf("error while downloading: %s", event.Message)
-			}
-			return fmt.Errorf("error while downloading")
 		}
 	}
-	return nil
+	return firstErr
 }

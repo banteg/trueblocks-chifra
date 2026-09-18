@@ -5,10 +5,15 @@
 package index
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/types"
@@ -83,5 +88,55 @@ func TestFetchWithRetriesHonorsLimit(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("attempts=%d", n)
+	}
+}
+
+func TestWriteReaderToPathRejectsConcurrentTruncation(t *testing.T) {
+	dir := t.TempDir()
+	full := filepath.Join(dir, "000000001-000000002.bin")
+	good := bytes.Repeat([]byte("a"), 16)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := writeReaderToPath(full, bytes.NewReader(good), 16, "good"); err != nil {
+			t.Errorf("good write: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		_ = writeReaderToPath(full, bytes.NewReader([]byte("bbb")), 16, "short")
+	}()
+	wg.Wait()
+
+	got, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, good) {
+		t.Fatalf("published %q", got)
+	}
+}
+
+func TestWriteReaderToPathMissingSize(t *testing.T) {
+	err := writeReaderToPath(filepath.Join(t.TempDir(), "x.bin"), bytes.NewReader([]byte("abc")), 0, "x")
+	if !errors.Is(err, ErrMissingSize) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRetryableDownloadErr(t *testing.T) {
+	if retryableDownloadErr(ErrMissingSize) {
+		t.Fatal("missing size is permanent")
+	}
+	if retryableDownloadErr(ErrUserHitControlC) {
+		t.Fatal("cancel is permanent")
+	}
+	if !retryableDownloadErr(ErrSizeMismatch) {
+		t.Fatal("short body should retry")
+	}
+	if !retryableDownloadErr(errors.New("gateway 502")) {
+		t.Fatal("remote errors should retry")
 	}
 }

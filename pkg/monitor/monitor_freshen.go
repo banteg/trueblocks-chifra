@@ -6,6 +6,7 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -135,66 +136,83 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		return canceled, err
 	}
 
-	var wg sync.WaitGroup
-	resultChannel := make(chan []index.AppearanceResult, len(files))
-	pending := make([]index.AppearanceResult, 0, len(files))
-
-	taskCount := 0
+	type freshenJob struct {
+		fileName string
+		rng      ranges.FileRange
+	}
+	jobs := make([]freshenJob, 0, len(files))
 	for _, info := range files {
 		if canceled {
-			m.Do(func() { logger.Warn(colors.Yellow+"Finishing", taskCount, "current tasks...", colors.Off) })
+			m.Do(func() { logger.Warn(colors.Yellow+"Finishing current tasks...", colors.Off) })
+			break
+		}
+		if info.IsDir() {
 			continue
 		}
-		if !info.IsDir() {
-			fileName := filepath.Join(bloomPath, info.Name())
-			if !walk.IsCacheType(fileName, walk.Index_Bloom, true /* checkExt */) {
-				continue // sometimes there are .gz files in this folder, for example
-			}
-			fileRange, err := ranges.RangeFromFilenameE(fileName)
-			if err != nil {
-				// don't respond further -- there may be foreign files in the folder
-				fmt.Println(err)
-				continue
-			}
-
-			max := os.Getenv("FAKE_FINAL_BLOCK") // This is for testing only, please ignore
-			if len(max) > 0 {
-				if fileRange.Last > base.MustParseBlknum(max) {
-					continue
-				}
-			}
-
-			if updater.TestMode && fileRange.Last > maxTestingBlock {
-				continue
-			}
-
-			if fileRange.EarlierThanB(updater.FirstBlock) {
-				continue
-			}
-
-			if taskCount >= updater.MaxTasks {
-				resArray := <-resultChannel
-				pending = append(pending, resArray...)
-				taskCount--
-			}
-
-			// Run a go routine for each index file
-			taskCount++
-			wg.Add(1)
-			go updater.visitChunkToFreshenFinal(fileName, resultChannel, &wg)
+		fileName := filepath.Join(bloomPath, info.Name())
+		if !walk.IsCacheType(fileName, walk.Index_Bloom, true /* checkExt */) {
+			continue // sometimes there are .gz files in this folder, for example
 		}
+		fileRange, err := ranges.RangeFromFilenameE(fileName)
+		if err != nil {
+			// don't respond further -- there may be foreign files in the folder
+			fmt.Println(err)
+			continue
+		}
+
+		max := os.Getenv("FAKE_FINAL_BLOCK") // This is for testing only, please ignore
+		if len(max) > 0 {
+			if fileRange.Last > base.MustParseBlknum(max) {
+				continue
+			}
+		}
+
+		if updater.TestMode && fileRange.Last > maxTestingBlock {
+			continue
+		}
+
+		if fileRange.EarlierThanB(updater.FirstBlock) {
+			continue
+		}
+
+		jobs = append(jobs, freshenJob{fileName: fileName, rng: fileRange})
 	}
 
-	wg.Wait()
-	close(resultChannel)
+	sort.Slice(jobs, func(i, j int) bool {
+		if jobs[i].rng.First != jobs[j].rng.First {
+			return jobs[i].rng.First < jobs[j].rng.First
+		}
+		return jobs[i].rng.Last < jobs[j].rng.Last
+	})
 
-	for resArray := range resultChannel {
-		pending = append(pending, resArray...)
+	batchSize := updater.MaxTasks
+	if batchSize < 1 {
+		batchSize = 1
 	}
-
-	keep, firstErr := partitionFreshenResults(pending)
-	for i := range keep {
-		updater.updateMonitors(&keep[i])
+	var firstErr error
+	for start := 0; start < len(jobs) && !canceled && firstErr == nil; start += batchSize {
+		end := start + batchSize
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+		batch := jobs[start:end]
+		var wg sync.WaitGroup
+		resultChannel := make(chan []index.AppearanceResult, len(batch))
+		for _, job := range batch {
+			wg.Add(1)
+			go updater.visitChunkToFreshenFinal(job.fileName, resultChannel, &wg)
+		}
+		wg.Wait()
+		close(resultChannel)
+		pending := make([]index.AppearanceResult, 0, len(batch)*len(updater.MonitorMap))
+		for resArray := range resultChannel {
+			pending = append(pending, resArray...)
+		}
+		keep, err := partitionFreshenResults(pending)
+		for i := range keep {
+			updater.updateMonitors(&keep[i])
+		}
+		firstErr = err
 	}
 
 	if firstErr == nil && !updater.TestMode {
@@ -237,7 +255,6 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		return canceled, firstErr
 	}
 	return canceled, moveErr
-
 }
 
 // visitChunkToFreshenFinal opens an index file, searches for the address(es) we're looking for and pushes
@@ -304,9 +321,15 @@ func (updater *MonitorUpdate) visitChunkToFreshenFinal(fileName string, resultCh
 
 	indexChunk, err := index.OpenIndex(indexFilename, true /* check */)
 	if err != nil {
+		if errors.Is(err, index.ErrCorruptIndex) || errors.Is(err, index.ErrIncorrectMagic) {
+			if remErr := os.Remove(indexFilename); remErr != nil && !os.IsNotExist(remErr) {
+				logger.Error("failed to remove corrupt index", indexFilename, remErr)
+			}
+		}
 		results = append(results, index.AppearanceResult{Range: bl.Range, Err: err})
 		return
 	}
+
 	defer indexChunk.Close()
 
 	for _, mon := range updater.MonitorMap {
@@ -314,38 +337,36 @@ func (updater *MonitorUpdate) visitChunkToFreshenFinal(fileName string, resultCh
 	}
 }
 
-// partitionFreshenResults sorts chunk results and drops anything at or after the
-// earliest failed range so LastScanned cannot leapfrog a hole.
+// partitionFreshenResults sorts chunk results and retains only ranges strictly
+// before the earliest failed range so LastScanned cannot leapfrog a hole.
 func partitionFreshenResults(results []index.AppearanceResult) ([]index.AppearanceResult, error) {
-	sorted := append([]index.AppearanceResult(nil), results...)
-	sort.SliceStable(sorted, func(i, j int) bool {
-		if sorted[i].Range.First != sorted[j].Range.First {
-			return sorted[i].Range.First < sorted[j].Range.First
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].Range.First != results[j].Range.First {
+			return results[i].Range.First < results[j].Range.First
 		}
-		return sorted[i].Range.Last < sorted[j].Range.Last
+		return results[i].Range.Last < results[j].Range.Last
 	})
 
 	var firstErr error
-	var holeAt base.Blknum
-	hasHole := false
-	keep := make([]index.AppearanceResult, 0, len(sorted))
-	for _, r := range sorted {
+	holeFirst := base.NOPOSN
+	for _, r := range results {
 		if r.Err != nil {
 			chunkErr := fmt.Errorf("%s: %w", r.Range, r.Err)
 			logger.Error("Error processing index file:", chunkErr)
-			if !hasHole || r.Range.First < holeAt {
+			if firstErr == nil || r.Range.First < holeFirst {
 				firstErr = chunkErr
-				holeAt = r.Range.First
-				hasHole = true
+				holeFirst = r.Range.First
 			}
-			continue
 		}
-		if hasHole && r.Range.First >= holeAt {
-			continue
-		}
-		keep = append(keep, r)
 	}
-	return keep, firstErr
+	if firstErr == nil {
+		return results, nil
+	}
+	n := 0
+	for n < len(results) && results[n].Range.First < holeFirst {
+		n++
+	}
+	return results[:n], firstErr
 }
 
 // updateMonitors writes an array of appearances to the Monitor file updating the header for lastScanned. It

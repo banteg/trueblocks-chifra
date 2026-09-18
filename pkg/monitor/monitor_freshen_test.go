@@ -45,3 +45,22 @@ func TestPartitionFreshenResultsNoErrorKeepsAll(t *testing.T) {
 		t.Fatalf("order=%v", keep)
 	}
 }
+
+func TestPartitionFreshenResultsDropsWholeFailedRange(t *testing.T) {
+	w := logger.GetLoggerWriter()
+	defer logger.SetLoggerWriter(w)
+	logger.SetLoggerWriter(io.Discard)
+
+	results := []index.AppearanceResult{
+		{Range: ranges.FileRange{First: 100, Last: 199}},
+		{Range: ranges.FileRange{First: 100, Last: 199}, Err: errors.New("eof")},
+		{Range: ranges.FileRange{First: 0, Last: 99}},
+	}
+	keep, err := partitionFreshenResults(results)
+	if err == nil || err.Error() != "000000100-000000199: eof" {
+		t.Fatalf("err=%v", err)
+	}
+	if len(keep) != 1 || keep[0].Range.First != 0 {
+		t.Fatalf("keep=%v", keep)
+	}
+}

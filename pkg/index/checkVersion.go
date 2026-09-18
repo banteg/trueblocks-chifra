@@ -16,6 +16,7 @@ import (
 var ErrNotInitialized = errors.New("index not initialized")
 var ErrIncorrectMagic = errors.New("incorrect magic number")
 var ErrIncorrectHash = errors.New("incorrect header hash")
+var ErrCorruptIndex = errors.New("corrupt index chunk")
 
 // IsInitialized returns an error if the version in the header is not as requested
 func IsInitialized(chain, required string) error {

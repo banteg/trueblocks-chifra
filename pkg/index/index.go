@@ -60,11 +60,28 @@ func OpenIndex(fileName string, check bool) (Index, error) {
 	indexChunk.Header, err = indexChunk.readHeader(check)
 	if err != nil {
 		indexChunk.Close()
-		return Index{}, fmt.Errorf("%w: %s", err, fileName)
+		return Index{}, fmt.Errorf("%w: %w: %s", ErrCorruptIndex, err, fileName)
 	}
 
-	indexChunk.AppTableStart = int64(HeaderWidth + (indexChunk.Header.AddressCount * AddrRecordWidth))
+	info, err := indexChunk.File.Stat()
+	if err != nil {
+		indexChunk.Close()
+		return Index{}, err
+	}
+	want := expectedIndexFileSize(indexChunk.Header)
+	if info.Size() != want {
+		indexChunk.Close()
+		return Index{}, fmt.Errorf("%w: %s size %d want %d", ErrCorruptIndex, fileName, info.Size(), want)
+	}
+
+	indexChunk.AppTableStart = int64(HeaderWidth) + int64(indexChunk.Header.AddressCount)*int64(AddrRecordWidth)
 	return indexChunk, nil
+}
+
+func expectedIndexFileSize(header indexHeader) int64 {
+	return int64(HeaderWidth) +
+		int64(header.AddressCount)*int64(AddrRecordWidth) +
+		int64(header.AppearanceCount)*int64(AppRecordWidth)
 }
 
 // Close closes the Index's associated File pointer (if opened)
