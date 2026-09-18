@@ -60,7 +60,7 @@ func OpenIndex(fileName string, check bool) (Index, error) {
 	indexChunk.Header, err = indexChunk.readHeader(check)
 	if err != nil {
 		indexChunk.Close()
-		return Index{}, fmt.Errorf("%w: %w: %s", ErrCorruptIndex, err, fileName)
+		return Index{}, fmt.Errorf("%w: %s: %s", ErrCorruptIndex, fileName, err)
 	}
 
 	info, err := indexChunk.File.Stat()

@@ -153,8 +153,12 @@ func downloadChunkToDisc(ctx context.Context, cancel context.CancelFunc, chain s
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		download, err := fetchFromIpfsGateway(ctx, gateway, hash)
-		if err == nil {
+		err := func() error {
+			download, err := fetchFromIpfsGateway(ctx, gateway, hash)
+			if err != nil {
+				return err
+			}
+			defer download.Body.Close()
 			res := &jobResult{
 				rng:      chunk.Range,
 				fileSize: download.ContentLen,
@@ -165,11 +169,11 @@ func downloadChunkToDisc(ctx context.Context, cancel context.CancelFunc, chain s
 				logger.Warn(sigintTrap.TrapMessage)
 			}
 			trapChannel := sigintTrap.Enable(ctx, cancel, cleanOnQuit)
-			err = writeBytesToDisc(chain, chunkType, res)
-			sigintTrap.Disable(trapChannel)
-			if err == nil {
-				return nil
-			}
+			defer sigintTrap.Disable(trapChannel)
+			return writeBytesToDisc(chain, chunkType, res)
+		}()
+		if err == nil {
+			return nil
 		}
 		lastErr = err
 		if !retryableDownloadErr(lastErr) || attempt == nRetries {
@@ -205,37 +209,6 @@ func retryableDownloadErr(err error) bool {
 		}
 	}
 	return true
-}
-
-func fetchWithRetries(ctx context.Context, gateway, hash string, nRetries int) (*fetchResult, error) {
-	if nRetries < 1 {
-		nRetries = 1
-	}
-	var lastErr error
-	delay := downloadRetryDelay
-	for attempt := 1; attempt <= nRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		result, err := fetchFromIpfsGateway(ctx, gateway, hash)
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-		if attempt == nRetries {
-			break
-		}
-		logger.Warn("Failed download", hash, "(will retry)", attempt, "of", nRetries)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(delay):
-		}
-		if delay > 0 && delay < 8*time.Second {
-			delay *= 2
-		}
-	}
-	return nil, lastErr
 }
 
 var downloadRetryDelay = time.Second
@@ -319,8 +292,6 @@ func DownloadChunks(chain string, chunksToDownload []types.ChunkRecord, chunkTyp
 
 // writeBytesToDisc save the downloaded bytes to disc
 func writeBytesToDisc(chain string, chunkType walk.CacheType, res *jobResult) error {
-	defer closeJobContents(res)
-
 	fullPath := filepath.Join(config.PathToIndex(chain), "finalized", res.rng+".bin")
 	if chunkType == walk.Index_Bloom {
 		fullPath = ToBloomPath(fullPath)
@@ -341,7 +312,12 @@ func writeReaderToPath(fullPath string, contents io.Reader, expected int64, rng 
 		return fmt.Errorf("error creating download temp file for %s in writeBytesToDisc: [%w]", rng, err)
 	}
 	tmpPath := outputFile.Name()
-	defer os.Remove(tmpPath)
+	success := false
+	defer func() {
+		if !success {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 	_ = outputFile.Chmod(0666)
 
 	written, err := io.Copy(outputFile, contents)
@@ -365,6 +341,7 @@ func writeReaderToPath(fullPath string, contents io.Reader, expected int64, rng 
 	if err := os.Rename(tmpPath, fullPath); err != nil {
 		return fmt.Errorf("error renaming %s file in writeBytesToDisc: [%s]", rng, err)
 	}
+	success = true
 	return nil
 }
 
@@ -381,15 +358,6 @@ func expectedChunkSize(chunkType walk.CacheType, res *jobResult) int64 {
 		}
 	}
 	return res.fileSize
-}
-
-func closeJobContents(res *jobResult) {
-	if res == nil {
-		return
-	}
-	if closer, ok := res.contents.(io.Closer); ok && closer != nil {
-		_ = closer.Close()
-	}
 }
 
 func removeLocalFile(fullPath, reason string, progressChannel progressChan) bool {
