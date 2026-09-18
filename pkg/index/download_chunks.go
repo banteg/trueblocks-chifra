@@ -16,7 +16,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,7 +24,6 @@ import (
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/colors"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/config"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/debug"
-	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/file"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/logger"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/progress"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/sigintTrap"
@@ -48,7 +46,6 @@ type progressChan chan<- *progress.ProgressMsg
 
 // Types of errors put into the progressChannel
 
-var ErrFailedLocalFileRemoval = errors.New("failed to remove local file")
 var ErrUserHitControlC = errors.New("user hit control + c")
 var ErrDownloadError = errors.New("download error")
 var ErrSizeMismatch = errors.New("downloaded chunk size mismatch")
@@ -105,17 +102,6 @@ func getDownloadWorker(chain string, workerArgs downloadWorkerArguments, chunkTy
 
 			err := downloadChunkToDisc(workerArgs.ctx, workerArgs.cancel, chain, chunkType, chunk, workerArgs.gatewayUrl, hash.String(), workerArgs.nRetries)
 			if errors.Is(workerArgs.ctx.Err(), context.Canceled) {
-				return
-			}
-			if workerArgs.ctx.Err() != nil {
-				chunkPath := filepath.Join(config.PathToIndex(chain), "finalized", chunk.Range+".bin")
-				removeLocalFile(ToIndexPath(chunkPath), "user canceled", progressChannel)
-				removeLocalFile(ToBloomPath(chunkPath), "user canceled", progressChannel)
-				progressChannel <- &progress.ProgressMsg{
-					Payload: &chunk,
-					Event:   progress.Error,
-					Error:   fmt.Errorf("%w [%s]", ErrUserHitControlC, workerArgs.ctx.Err().Error()),
-				}
 				return
 			}
 			if err != nil {
@@ -192,22 +178,12 @@ func downloadChunkToDisc(ctx context.Context, cancel context.CancelFunc, chain s
 }
 
 func retryableDownloadErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, ErrUserHitControlC) || errors.Is(err, ErrMissingSize) {
-		return false
-	}
-	if os.IsPermission(err) {
-		return false
-	}
-	var pathErr *os.PathError
-	if errors.As(err, &pathErr) {
-		if pathErr.Err == syscall.ENOSPC || pathErr.Err == syscall.EACCES || pathErr.Err == syscall.EPERM {
-			return false
-		}
-	}
-	return true
+	return err != nil &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, ErrUserHitControlC) &&
+		!errors.Is(err, ErrMissingSize) &&
+		!errors.Is(err, os.ErrPermission) &&
+		!errors.Is(err, syscall.ENOSPC)
 }
 
 var downloadRetryDelay = time.Second
@@ -227,26 +203,14 @@ func fetchFromIpfsGateway(ctx context.Context, gateway, hash string) (*fetchResu
 	if err != nil {
 		return nil, fmt.Errorf("DefaultClient.Do %s returned error: %w", url, err)
 	}
-
 	if response.StatusCode != 200 {
-		_, _ = io.Copy(io.Discard, response.Body)
 		response.Body.Close()
 		return nil, fmt.Errorf("fetchFromIpfsGateway %s returned status code: %d", url, response.StatusCode)
 	}
 
-	contentLen := int64(0)
-	if len(response.Header.Get("Content-Length")) != 0 {
-		contentLen, err = strconv.ParseInt(response.Header.Get("Content-Length"), 10, 64)
-		if err != nil {
-			_, _ = io.Copy(io.Discard, response.Body)
-			response.Body.Close()
-			return nil, fmt.Errorf("response.Header.Get %s returned error: %w", url, err)
-		}
-	}
-
 	return &fetchResult{
 		Body:       response.Body,
-		ContentLen: contentLen,
+		ContentLen: response.ContentLength,
 	}, nil
 }
 
@@ -311,13 +275,7 @@ func writeReaderToPath(fullPath string, contents io.Reader, expected int64, rng 
 		return fmt.Errorf("error creating download temp file for %s in writeBytesToDisc: [%w]", rng, err)
 	}
 	tmpPath := outputFile.Name()
-	success := false
-	defer func() {
-		if !success {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	_ = outputFile.Chmod(0666)
+	defer os.Remove(tmpPath)
 
 	written, err := io.Copy(outputFile, contents)
 	closeErr := outputFile.Close()
@@ -340,7 +298,6 @@ func writeReaderToPath(fullPath string, contents io.Reader, expected int64, rng 
 	if err := os.Rename(tmpPath, fullPath); err != nil {
 		return fmt.Errorf("error renaming %s file in writeBytesToDisc: [%w]", rng, err)
 	}
-	success = true
 	return nil
 }
 
@@ -357,22 +314,4 @@ func expectedChunkSize(chunkType walk.CacheType, res *jobResult) int64 {
 		}
 	}
 	return res.fileSize
-}
-
-func removeLocalFile(fullPath, reason string, progressChannel progressChan) bool {
-	if file.FileExists(fullPath) {
-		err := os.Remove(fullPath)
-		if err != nil {
-			progressChannel <- &progress.ProgressMsg{
-				Event: progress.Error,
-				Error: fmt.Errorf("%w %s [%s]", ErrFailedLocalFileRemoval, fullPath, err.Error()),
-			}
-		} else {
-			progressChannel <- &progress.ProgressMsg{
-				Event:   progress.Update,
-				Message: fmt.Sprintf("File %s removed [%s]", fullPath, reason),
-			}
-		}
-	}
-	return file.FileExists(fullPath)
 }

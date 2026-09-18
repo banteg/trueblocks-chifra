@@ -1,7 +1,9 @@
 package index
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/ranges"
@@ -60,7 +62,10 @@ func OpenIndex(fileName string, check bool) (Index, error) {
 	indexChunk.Header, err = indexChunk.readHeader(check)
 	if err != nil {
 		indexChunk.Close()
-		return Index{}, fmt.Errorf("%w: %s: %w", ErrCorruptIndex, fileName, err)
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrIncorrectMagic) {
+			return Index{}, fmt.Errorf("%w: %s: %w", ErrCorruptIndex, fileName, err)
+		}
+		return Index{}, fmt.Errorf("%s: %w", fileName, err)
 	}
 
 	info, err := indexChunk.File.Stat()

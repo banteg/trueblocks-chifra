@@ -321,7 +321,7 @@ func (updater *MonitorUpdate) visitChunkToFreshenFinal(fileName string, resultCh
 
 	indexChunk, err := index.OpenIndex(indexFilename, true /* check */)
 	if err != nil {
-		if errors.Is(err, index.ErrCorruptIndex) || errors.Is(err, index.ErrIncorrectMagic) {
+		if errors.Is(err, index.ErrCorruptIndex) {
 			corruptName := indexFilename + ".corrupt"
 			if renErr := os.Rename(indexFilename, corruptName); renErr != nil && !os.IsNotExist(renErr) {
 				logger.Error("failed to quarantine corrupt index", indexFilename, renErr)

@@ -63,3 +63,15 @@ func TestSearchForAddressRecordIOError(t *testing.T) {
 		t.Fatal("expected seek/read error")
 	}
 }
+
+func TestOpenIndexHeaderReadErrorNotCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	// Opening a directory with O_RDONLY succeeds on unix, but binary.Read/read syscall returns EISDIR (an environmental error, not EOF/magic corruption)
+	_, err := OpenIndex(dir, false)
+	if err == nil {
+		t.Fatal("expected error opening directory as index file")
+	}
+	if errors.Is(err, ErrCorruptIndex) {
+		t.Fatalf("expected non-corruption read error, got: %v", err)
+	}
+}
