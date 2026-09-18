@@ -29,6 +29,10 @@ func TestExpectedChunkSize(t *testing.T) {
 	if got := expectedChunkSize(walk.Index_Final, fallback); got != 7 {
 		t.Fatalf("content-length fallback: got %d", got)
 	}
+	unknown := &jobResult{theChunk: &types.ChunkRecord{}}
+	if got := expectedChunkSize(walk.Index_Final, unknown); got != 0 {
+		t.Fatalf("unknown size should fail closed: got %d", got)
+	}
 }
 
 func TestFetchWithRetries(t *testing.T) {

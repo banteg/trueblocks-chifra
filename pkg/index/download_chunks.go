@@ -161,6 +161,7 @@ func fetchWithRetries(ctx context.Context, gateway, hash string, nRetries int) (
 		nRetries = 1
 	}
 	var lastErr error
+	delay := downloadRetryDelay
 	for attempt := 1; attempt <= nRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -177,7 +178,10 @@ func fetchWithRetries(ctx context.Context, gateway, hash string, nRetries int) (
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(downloadRetryDelay):
+		case <-time.After(delay):
+		}
+		if delay > 0 && delay < 8*time.Second {
+			delay *= 2
 		}
 	}
 	return nil, lastErr
@@ -379,7 +383,11 @@ func writeBytesToDisc(chain string, chunkType walk.CacheType, res *jobResult) er
 	}
 
 	expected := expectedChunkSize(chunkType, res)
-	if expected > 0 && written != expected {
+	if expected <= 0 {
+		os.Remove(tmpPath)
+		return fmt.Errorf("%w for %s: missing expected size (wrote %d)", ErrSizeMismatch, res.rng, written)
+	}
+	if written != expected {
 		os.Remove(tmpPath)
 		return fmt.Errorf("%w for %s: wrote %d, expected %d", ErrSizeMismatch, res.rng, written, expected)
 	}

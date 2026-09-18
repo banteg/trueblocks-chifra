@@ -21,7 +21,7 @@ func TestPartitionFreshenResultsSkipsPastHole(t *testing.T) {
 		{Range: ranges.FileRange{First: 0, Last: 99}},
 	}
 	keep, err := partitionFreshenResults(results)
-	if err == nil || err.Error() != "download failed" {
+	if err == nil || err.Error() != "000000100-000000199: download failed" {
 		t.Fatalf("err=%v", err)
 	}
 	if len(keep) != 1 || keep[0].Range.First != 0 || keep[0].Range.Last != 99 {

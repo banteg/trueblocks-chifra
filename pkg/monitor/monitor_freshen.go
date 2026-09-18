@@ -304,9 +304,6 @@ func (updater *MonitorUpdate) visitChunkToFreshenFinal(fileName string, resultCh
 
 	indexChunk, err := index.OpenIndex(indexFilename, true /* check */)
 	if err != nil {
-		if remErr := os.Remove(indexFilename); remErr != nil && !os.IsNotExist(remErr) {
-			logger.Error("failed to remove corrupt index", indexFilename, remErr)
-		}
 		results = append(results, index.AppearanceResult{Range: bl.Range, Err: err})
 		return
 	}
@@ -334,9 +331,10 @@ func partitionFreshenResults(results []index.AppearanceResult) ([]index.Appearan
 	keep := make([]index.AppearanceResult, 0, len(sorted))
 	for _, r := range sorted {
 		if r.Err != nil {
-			logger.Error("Error processing index file:", r.Err)
+			chunkErr := fmt.Errorf("%s: %w", r.Range, r.Err)
+			logger.Error("Error processing index file:", chunkErr)
 			if !hasHole || r.Range.First < holeAt {
-				firstErr = r.Err
+				firstErr = chunkErr
 				holeAt = r.Range.First
 				hasHole = true
 			}
@@ -359,7 +357,7 @@ func (updater *MonitorUpdate) updateMonitors(result *index.AppearanceResult) {
 	}
 
 	if result.Err != nil {
-		logger.Error("Error processing index file:", result.Err)
+		logger.Error("Error processing index file:", result.Range, result.Err)
 		return
 	}
 
