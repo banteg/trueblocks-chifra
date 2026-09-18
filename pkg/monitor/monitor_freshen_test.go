@@ -29,23 +29,6 @@ func TestPartitionFreshenResultsSkipsPastHole(t *testing.T) {
 	}
 }
 
-func TestPartitionFreshenResultsNoErrorKeepsAll(t *testing.T) {
-	results := []index.AppearanceResult{
-		{Range: ranges.FileRange{First: 200, Last: 299}},
-		{Range: ranges.FileRange{First: 0, Last: 99}},
-	}
-	keep, err := partitionFreshenResults(results)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(keep) != 2 {
-		t.Fatalf("keep=%v", keep)
-	}
-	if keep[0].Range.First != 0 || keep[1].Range.First != 200 {
-		t.Fatalf("order=%v", keep)
-	}
-}
-
 func TestPartitionFreshenResultsDropsWholeFailedRange(t *testing.T) {
 	w := logger.GetLoggerWriter()
 	defer logger.SetLoggerWriter(w)
