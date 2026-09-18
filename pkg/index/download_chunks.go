@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/colors"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/config"
@@ -50,6 +51,7 @@ var ErrFailedLocalFileRemoval = errors.New("failed to remove local file")
 var ErrUserHitControlC = errors.New("user hit control + c")
 var ErrDownloadError = errors.New("download error")
 var ErrWriteToDiscError = errors.New("write to disc error")
+var ErrSizeMismatch = errors.New("downloaded chunk size mismatch")
 
 // WorkerArguments are types meant to hold worker function arguments. We cannot
 // pass the arguments directly, because a worker function is expected to take one
@@ -106,8 +108,11 @@ func getDownloadWorker(chain string, workerArgs downloadWorkerArguments, chunkTy
 					Message: msg,
 				}
 
-				download, err := fetchFromIpfsGateway(workerArgs.ctx, workerArgs.gatewayUrl, hash.String())
+				download, err := fetchWithRetries(workerArgs.ctx, workerArgs.gatewayUrl, hash.String(), workerArgs.nRetries)
 				if errors.Is(workerArgs.ctx.Err(), context.Canceled) {
+					if download != nil && download.Body != nil {
+						download.Body.Close()
+					}
 					// The request to fetch the chunk was cancelled, because user has
 					// pressed Ctrl-C
 					return
@@ -151,6 +156,35 @@ type fetchResult struct {
 	ContentLen int64 // download size in bytes
 }
 
+func fetchWithRetries(ctx context.Context, gateway, hash string, nRetries int) (*fetchResult, error) {
+	if nRetries < 1 {
+		nRetries = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= nRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result, err := fetchFromIpfsGateway(ctx, gateway, hash)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if attempt == nRetries {
+			break
+		}
+		logger.Warn("Failed download", hash, "(will retry)", attempt, "of", nRetries)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(downloadRetryDelay):
+		}
+	}
+	return nil, lastErr
+}
+
+var downloadRetryDelay = time.Second
+
 // fetchFromIpfsGateway downloads a chunk from an IPFS gateway using HTTP
 func fetchFromIpfsGateway(ctx context.Context, gateway, hash string) (*fetchResult, error) {
 	url, _ := url.Parse(gateway)
@@ -168,6 +202,8 @@ func fetchFromIpfsGateway(ctx context.Context, gateway, hash string) (*fetchResu
 	}
 
 	if response.StatusCode != 200 {
+		_, _ = io.Copy(io.Discard, response.Body)
+		response.Body.Close()
 		return nil, fmt.Errorf("fetchFromIpfsGateway %s returned status code: %d", url, response.StatusCode)
 	}
 
@@ -175,13 +211,14 @@ func fetchFromIpfsGateway(ctx context.Context, gateway, hash string) (*fetchResu
 	if len(response.Header.Get("Content-Length")) != 0 {
 		contentLen, err = strconv.ParseInt(response.Header.Get("Content-Length"), 10, 64)
 		if err != nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
 			return nil, fmt.Errorf("response.Header.Get %s returned error: %w", url, err)
 		}
 	}
 
-	body := response.Body
 	return &fetchResult{
-		Body:       body,
+		Body:       response.Body,
 		ContentLen: contentLen,
 	}, nil
 }
@@ -309,34 +346,73 @@ func DownloadChunks(chain string, chunksToDownload []types.ChunkRecord, chunkTyp
 
 // writeBytesToDisc save the downloaded bytes to disc
 func writeBytesToDisc(chain string, chunkType walk.CacheType, res *jobResult) error {
+	defer closeJobContents(res)
+
 	fullPath := filepath.Join(config.PathToIndex(chain), "finalized", res.rng+".bin")
 	if chunkType == walk.Index_Bloom {
 		fullPath = ToBloomPath(fullPath)
 	}
-	outputFile, err := os.OpenFile(fullPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	tmpPath := fullPath + ".download.tmp"
+	_ = os.Remove(tmpPath)
+
+	outputFile, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
 		return fmt.Errorf("error creating output file file %s in writeBytesToDisc: [%s]", res.rng, err)
 	}
 
-	// Save downloaded bytes to a file
-	_, err = io.Copy(outputFile, res.contents)
+	written, err := io.Copy(outputFile, res.contents)
+	closeErr := outputFile.Close()
 	if err != nil {
-		if file.FileExists(outputFile.Name()) {
-			outputFile.Close()
-			os.Remove(outputFile.Name())
-			col := colors.Magenta
-			if fullPath == ToIndexPath(fullPath) {
-				col = colors.Yellow
-			}
-			logger.Warn("Failed download", col, res.rng, colors.Off, "(will retry)", strings.Repeat(" ", 30))
+		os.Remove(tmpPath)
+		col := colors.Magenta
+		if fullPath == ToIndexPath(fullPath) {
+			col = colors.Yellow
 		}
+		logger.Warn("Failed download", col, res.rng, colors.Off, "(will retry)", strings.Repeat(" ", 30))
 		// Information about this error
 		// https://community.k6.io/t/warn-0040-request-failed-error-stream-error-stream-id-3-internal-error/777/2
 		return fmt.Errorf("error copying %s file in writeBytesToDisc: [%s]", res.rng, err)
 	}
+	if closeErr != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("error closing %s file in writeBytesToDisc: [%s]", res.rng, closeErr)
+	}
 
-	outputFile.Close()
+	expected := expectedChunkSize(chunkType, res)
+	if expected > 0 && written != expected {
+		os.Remove(tmpPath)
+		return fmt.Errorf("%w for %s: wrote %d, expected %d", ErrSizeMismatch, res.rng, written, expected)
+	}
+
+	if err := os.Rename(tmpPath, fullPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("error renaming %s file in writeBytesToDisc: [%s]", res.rng, err)
+	}
 	return nil
+}
+
+func expectedChunkSize(chunkType walk.CacheType, res *jobResult) int64 {
+	if res == nil {
+		return 0
+	}
+	if res.theChunk != nil {
+		if chunkType == walk.Index_Bloom && res.theChunk.BloomSize > 0 {
+			return res.theChunk.BloomSize
+		}
+		if chunkType != walk.Index_Bloom && res.theChunk.IndexSize > 0 {
+			return res.theChunk.IndexSize
+		}
+	}
+	return res.fileSize
+}
+
+func closeJobContents(res *jobResult) {
+	if res == nil {
+		return
+	}
+	if closer, ok := res.contents.(io.Closer); ok && closer != nil {
+		_ = closer.Close()
+	}
 }
 
 func removeLocalFile(fullPath, reason string, progressChannel progressChan) bool {

@@ -137,6 +137,7 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 
 	var wg sync.WaitGroup
 	resultChannel := make(chan []index.AppearanceResult, len(files))
+	pending := make([]index.AppearanceResult, 0, len(files))
 
 	taskCount := 0
 	for _, info := range files {
@@ -173,9 +174,7 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 
 			if taskCount >= updater.MaxTasks {
 				resArray := <-resultChannel
-				for _, r := range resArray {
-					updater.updateMonitors(&r)
-				}
+				pending = append(pending, resArray...)
 				taskCount--
 			}
 
@@ -190,12 +189,15 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 	close(resultChannel)
 
 	for resArray := range resultChannel {
-		for _, r := range resArray {
-			updater.updateMonitors(&r)
-		}
+		pending = append(pending, resArray...)
 	}
 
-	if !updater.TestMode {
+	keep, firstErr := partitionFreshenResults(pending)
+	for i := range keep {
+		updater.updateMonitors(&keep[i])
+	}
+
+	if firstErr == nil && !updater.TestMode {
 		// TODO: Note we could actually test this if we had the concept of a FAKE_HEAD block
 		stagePath := index.ToStagingPath(filepath.Join(config.PathToIndex(updater.Chain), "staging"))
 		stageFn, _ := file.LatestFileInFolder(stagePath)
@@ -230,7 +232,12 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		}
 	}
 
-	return canceled, updater.moveAllToProduction()
+	moveErr := updater.moveAllToProduction()
+	if firstErr != nil {
+		return canceled, firstErr
+	}
+	return canceled, moveErr
+
 }
 
 // visitChunkToFreshenFinal opens an index file, searches for the address(es) we're looking for and pushes
@@ -297,6 +304,9 @@ func (updater *MonitorUpdate) visitChunkToFreshenFinal(fileName string, resultCh
 
 	indexChunk, err := index.OpenIndex(indexFilename, true /* check */)
 	if err != nil {
+		if remErr := os.Remove(indexFilename); remErr != nil && !os.IsNotExist(remErr) {
+			logger.Error("failed to remove corrupt index", indexFilename, remErr)
+		}
 		results = append(results, index.AppearanceResult{Range: bl.Range, Err: err})
 		return
 	}
@@ -307,16 +317,49 @@ func (updater *MonitorUpdate) visitChunkToFreshenFinal(fileName string, resultCh
 	}
 }
 
+// partitionFreshenResults sorts chunk results and drops anything at or after the
+// earliest failed range so LastScanned cannot leapfrog a hole.
+func partitionFreshenResults(results []index.AppearanceResult) ([]index.AppearanceResult, error) {
+	sorted := append([]index.AppearanceResult(nil), results...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Range.First != sorted[j].Range.First {
+			return sorted[i].Range.First < sorted[j].Range.First
+		}
+		return sorted[i].Range.Last < sorted[j].Range.Last
+	})
+
+	var firstErr error
+	var holeAt base.Blknum
+	hasHole := false
+	keep := make([]index.AppearanceResult, 0, len(sorted))
+	for _, r := range sorted {
+		if r.Err != nil {
+			logger.Error("Error processing index file:", r.Err)
+			if !hasHole || r.Range.First < holeAt {
+				firstErr = r.Err
+				holeAt = r.Range.First
+				hasHole = true
+			}
+			continue
+		}
+		if hasHole && r.Range.First >= holeAt {
+			continue
+		}
+		keep = append(keep, r)
+	}
+	return keep, firstErr
+}
+
 // updateMonitors writes an array of appearances to the Monitor file updating the header for lastScanned. It
 // is called by 'chifra list' and 'chifra export' prior to reporting results
 func (updater *MonitorUpdate) updateMonitors(result *index.AppearanceResult) {
 	if result == nil {
-		fmt.Println("Should not happen -- null result")
+		logger.Error("Should not happen -- null result")
 		return
 	}
 
 	if result.Err != nil {
-		fmt.Println("Error processing index file:", result.Err)
+		logger.Error("Error processing index file:", result.Err)
 		return
 	}
 
