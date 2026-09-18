@@ -322,8 +322,9 @@ func (updater *MonitorUpdate) visitChunkToFreshenFinal(fileName string, resultCh
 	indexChunk, err := index.OpenIndex(indexFilename, true /* check */)
 	if err != nil {
 		if errors.Is(err, index.ErrCorruptIndex) || errors.Is(err, index.ErrIncorrectMagic) {
-			if remErr := os.Remove(indexFilename); remErr != nil && !os.IsNotExist(remErr) {
-				logger.Error("failed to remove corrupt index", indexFilename, remErr)
+			corruptName := indexFilename + ".corrupt"
+			if renErr := os.Rename(indexFilename, corruptName); renErr != nil && !os.IsNotExist(renErr) {
+				logger.Error("failed to quarantine corrupt index", indexFilename, renErr)
 			}
 		}
 		results = append(results, index.AppearanceResult{Range: bl.Range, Err: err})

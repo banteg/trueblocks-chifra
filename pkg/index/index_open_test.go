@@ -38,6 +38,17 @@ func TestOpenIndexRejectsTruncatedTables(t *testing.T) {
 	}
 }
 
+func TestOpenIndexAcceptsExactSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "000000001-000000002.bin")
+	tables := make([]byte, AddrRecordWidth+AppRecordWidth)
+	writeTestIndex(t, path, 1, 1, tables)
+	idx, err := OpenIndex(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.Close()
+}
+
 func TestSearchForAddressRecordIOError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "000000001-000000002.bin")
 	tables := make([]byte, AddrRecordWidth)
@@ -50,5 +61,13 @@ func TestSearchForAddressRecordIOError(t *testing.T) {
 	_, err = idx.searchForAddressRecord(base.Address{})
 	if err == nil {
 		t.Fatal("expected seek/read error")
+	}
+}
+
+func TestExpectedIndexFileSize(t *testing.T) {
+	got := expectedIndexFileSize(indexHeader{AddressCount: 2, AppearanceCount: 3})
+	want := int64(HeaderWidth) + 2*int64(AddrRecordWidth) + 3*int64(AppRecordWidth)
+	if got != want {
+		t.Fatalf("got %d want %d", got, want)
 	}
 }

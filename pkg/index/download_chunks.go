@@ -51,7 +51,6 @@ type progressChan chan<- *progress.ProgressMsg
 var ErrFailedLocalFileRemoval = errors.New("failed to remove local file")
 var ErrUserHitControlC = errors.New("user hit control + c")
 var ErrDownloadError = errors.New("download error")
-var ErrWriteToDiscError = errors.New("write to disc error")
 var ErrSizeMismatch = errors.New("downloaded chunk size mismatch")
 var ErrMissingSize = errors.New("missing expected chunk size")
 
@@ -330,16 +329,16 @@ func writeReaderToPath(fullPath string, contents io.Reader, expected int64, rng 
 		logger.Warn("Failed download", col, rng, colors.Off, strings.Repeat(" ", 30))
 		// Information about this error
 		// https://community.k6.io/t/warn-0040-request-failed-error-stream-error-stream-id-3-internal-error/777/2
-		return fmt.Errorf("error copying %s file in writeBytesToDisc: [%s]", rng, err)
+		return fmt.Errorf("error copying %s file in writeBytesToDisc: [%w]", rng, err)
 	}
 	if closeErr != nil {
-		return fmt.Errorf("error closing %s file in writeBytesToDisc: [%s]", rng, closeErr)
+		return fmt.Errorf("error closing %s file in writeBytesToDisc: [%w]", rng, closeErr)
 	}
 	if written != expected {
 		return fmt.Errorf("%w for %s: wrote %d, expected %d", ErrSizeMismatch, rng, written, expected)
 	}
 	if err := os.Rename(tmpPath, fullPath); err != nil {
-		return fmt.Errorf("error renaming %s file in writeBytesToDisc: [%s]", rng, err)
+		return fmt.Errorf("error renaming %s file in writeBytesToDisc: [%w]", rng, err)
 	}
 	success = true
 	return nil
