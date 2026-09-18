@@ -38,6 +38,25 @@ func TestOpenIndexRejectsTruncatedTables(t *testing.T) {
 	}
 }
 
+func TestOpenIndexWrapsMagicAndCorrupt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "000000001-000000002.bin")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := indexHeader{Magic: 0xbad, AddressCount: 0, AppearanceCount: 0}
+	if err := binary.Write(f, binary.LittleEndian, &hdr); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = OpenIndex(path, false)
+	if !errors.Is(err, ErrCorruptIndex) || !errors.Is(err, ErrIncorrectMagic) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestOpenIndexAcceptsExactSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "000000001-000000002.bin")
 	tables := make([]byte, AddrRecordWidth+AppRecordWidth)
