@@ -33,8 +33,7 @@ import (
 	ants "github.com/panjf2000/ants/v2"
 )
 
-// jobResult type is used to carry both downloaded data and some
-// metadata to decompressing/file writing function through a channel
+// jobResult carries a download body and the metadata needed to validate and save it.
 type jobResult struct {
 	rng      string
 	fileSize int64
@@ -56,7 +55,6 @@ var ErrMissingSize = errors.New("missing expected chunk size")
 // parameter of type interface{}.
 type downloadWorkerArguments struct {
 	ctx             context.Context
-	cancel          context.CancelFunc
 	progressChannel progressChan
 	gatewayUrl      string
 	downloadWg      *sync.WaitGroup
@@ -100,7 +98,7 @@ func getDownloadWorker(chain string, workerArgs downloadWorkerArguments, chunkTy
 				Message: msg,
 			}
 
-			err := downloadChunkToDisc(workerArgs.ctx, workerArgs.cancel, chain, chunkType, chunk, workerArgs.gatewayUrl, hash.String(), workerArgs.nRetries)
+			err := downloadChunkToDisc(workerArgs.ctx, chain, chunkType, chunk, workerArgs.gatewayUrl, hash.String(), workerArgs.nRetries)
 			if errors.Is(workerArgs.ctx.Err(), context.Canceled) {
 				return
 			}
@@ -128,7 +126,7 @@ type fetchResult struct {
 	ContentLen int64 // download size in bytes
 }
 
-func downloadChunkToDisc(ctx context.Context, cancel context.CancelFunc, chain string, chunkType walk.CacheType, chunk types.ChunkRecord, gateway, hash string, nRetries int) error {
+func downloadChunkToDisc(ctx context.Context, chain string, chunkType walk.CacheType, chunk types.ChunkRecord, gateway, hash string, nRetries int) error {
 	if nRetries < 1 {
 		nRetries = 1
 	}
@@ -150,11 +148,6 @@ func downloadChunkToDisc(ctx context.Context, cancel context.CancelFunc, chain s
 				contents: download.Body,
 				theChunk: &chunk,
 			}
-			cleanOnQuit := func() {
-				logger.Warn(sigintTrap.TrapMessage)
-			}
-			trapChannel := sigintTrap.Enable(ctx, cancel, cleanOnQuit)
-			defer sigintTrap.Disable(trapChannel)
 			return writeBytesToDisc(chain, chunkType, res)
 		}()
 		if err == nil {
@@ -219,11 +212,12 @@ func fetchFromIpfsGateway(ctx context.Context, gateway, hash string) (*fetchResu
 func DownloadChunks(chain string, chunksToDownload []types.ChunkRecord, chunkType walk.CacheType, poolSize int, progressChannel progressChan) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	trapChannel := sigintTrap.Enable(ctx, cancel, func() { logger.Warn(sigintTrap.TrapMessage) })
+	defer sigintTrap.Disable(trapChannel)
 
 	var downloadWg sync.WaitGroup
 	downloadWorkerArgs := downloadWorkerArguments{
 		ctx:             ctx,
-		cancel:          cancel,
 		progressChannel: progressChannel,
 		downloadWg:      &downloadWg,
 		gatewayUrl:      config.GetChain(chain).IpfsGateway,

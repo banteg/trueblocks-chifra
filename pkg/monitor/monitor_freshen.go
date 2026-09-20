@@ -95,13 +95,10 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		defer unlockForAddress(address) // reminder: this defers until the function returns, not this loop
 	}
 
-	var m sync.Once
-	canceled := false
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	cleanOnQuit := func() {
-		canceled = true
 		logger.Warn(colors.Yellow+"User hit control+c...", colors.Off)
-		cancel()
 	}
 	trapChannel := sigintTrap.Enable(ctx, cancel, cleanOnQuit)
 	defer sigintTrap.Disable(trapChannel)
@@ -110,7 +107,7 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 	for _, addr := range updater.Addrs {
 		err := needsMigration(addr)
 		if err != nil {
-			return canceled, err
+			return ctx.Err() != nil, err
 		}
 
 		if updater.MonitorMap[base.HexToAddress(addr)] == nil {
@@ -127,13 +124,13 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 	}
 
 	if updater.SkipFreshen {
-		return canceled, nil
+		return ctx.Err() != nil, nil
 	}
 
 	bloomPath := filepath.Join(config.PathToIndex(updater.Chain), "blooms")
 	files, err := os.ReadDir(bloomPath)
 	if err != nil {
-		return canceled, err
+		return ctx.Err() != nil, err
 	}
 
 	type freshenJob struct {
@@ -142,8 +139,8 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 	}
 	jobs := make([]freshenJob, 0, len(files))
 	for _, info := range files {
-		if canceled {
-			m.Do(func() { logger.Warn(colors.Yellow+"Finishing current tasks...", colors.Off) })
+		if ctx.Err() != nil {
+			logger.Warn(colors.Yellow+"Finishing current tasks...", colors.Off)
 			break
 		}
 		if info.IsDir() {
@@ -190,7 +187,7 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		batchSize = 1
 	}
 	var firstErr error
-	for start := 0; start < len(jobs) && !canceled && firstErr == nil; start += batchSize {
+	for start := 0; start < len(jobs) && ctx.Err() == nil && firstErr == nil; start += batchSize {
 		end := start + batchSize
 		if end > len(jobs) {
 			end = len(jobs)
@@ -215,7 +212,7 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		firstErr = err
 	}
 
-	if firstErr == nil && !updater.TestMode {
+	if firstErr == nil && ctx.Err() == nil && !updater.TestMode {
 		// TODO: Note we could actually test this if we had the concept of a FAKE_HEAD block
 		stagePath := index.ToStagingPath(filepath.Join(config.PathToIndex(updater.Chain), "staging"))
 		stageFn, _ := file.LatestFileInFolder(stagePath)
@@ -252,9 +249,9 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 
 	moveErr := updater.moveAllToProduction()
 	if firstErr != nil {
-		return canceled, firstErr
+		return ctx.Err() != nil, firstErr
 	}
-	return canceled, moveErr
+	return ctx.Err() != nil, moveErr
 }
 
 // visitChunkToFreshenFinal opens an index file, searches for the address(es) we're looking for and pushes

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/base"
@@ -65,11 +66,14 @@ func TestSearchForAddressRecordIOError(t *testing.T) {
 }
 
 func TestOpenIndexHeaderReadErrorNotCorrupt(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "000000001-000000002.bin")
+	if err := os.Mkdir(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
 	// Opening a directory with O_RDONLY succeeds on unix, but binary.Read/read syscall returns EISDIR (an environmental error, not EOF/magic corruption)
 	_, err := OpenIndex(dir, false)
-	if err == nil {
-		t.Fatal("expected error opening directory as index file")
+	if !errors.Is(err, syscall.EISDIR) {
+		t.Fatalf("expected directory read error, got: %v", err)
 	}
 	if errors.Is(err, ErrCorruptIndex) {
 		t.Fatalf("expected non-corruption read error, got: %v", err)

@@ -9,9 +9,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/progress"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -21,6 +23,7 @@ import (
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/types"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/walk"
 )
+
 func TestWriteReaderToPathRejectsConcurrentTruncation(t *testing.T) {
 	dir := t.TempDir()
 	full := filepath.Join(dir, "000000001-000000002.bin")
@@ -118,7 +121,7 @@ func TestDownloadChunkToDiscRetries(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			err := downloadChunkToDisc(ctx, cancel, "testchain", walk.Index_Final, chunk, server.URL, "fakehash", 3)
+			err := downloadChunkToDisc(ctx, "testchain", walk.Index_Final, chunk, server.URL, "fakehash", 3)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -138,3 +141,48 @@ func TestDownloadChunkToDiscRetries(t *testing.T) {
 	}
 }
 
+// Run in a subprocess because SIGINT is process-wide and sigintTrap's cleanup is shared.
+func TestDownloadChunksInterruptBeforeHeaders(t *testing.T) {
+	if os.Getenv("CHIFRA_TEST_DOWNLOAD_INTERRUPT") == "1" {
+		http.DefaultClient = &http.Client{Transport: interruptTransport{}}
+		updates := make(chan *progress.ProgressMsg)
+		go func() {
+			DownloadChunks("mainnet", []types.ChunkRecord{{Range: "000000001-000000002", IndexHash: "fakehash"}}, walk.Index_Final, 1, updates)
+			close(updates)
+		}()
+		cancelled := false
+		for event := range updates {
+			if event.Event == progress.Cancelled {
+				cancelled = true
+			}
+			if event.Event == progress.Error || event.Event == progress.AllDone {
+				t.Fatalf("unexpected event after interrupt: %+v", event)
+			}
+		}
+		if !cancelled {
+			t.Fatal("missing cancellation event")
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDownloadChunksInterruptBeforeHeaders$")
+	cmd.Env = append(os.Environ(), "CHIFRA_TEST_DOWNLOAD_INTERRUPT=1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("download interrupt: %v\n%s", err, output)
+	}
+}
+
+type interruptTransport struct{}
+
+func (interruptTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		return nil, err
+	}
+	if err := process.Signal(os.Interrupt); err != nil {
+		return nil, err
+	}
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}

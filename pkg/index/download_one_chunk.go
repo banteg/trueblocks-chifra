@@ -28,7 +28,6 @@ func DownloadOneChunk(chain string, man *manifest.Manifest, fileRange ranges.Fil
 	logger.Info("Bloom filter hit, downloading index portion", (colors.Yellow + fileRange.String() + colors.Off), "from IPFS.")
 
 	// Start downloading the filter
-	matchedPin.BloomHash = "" // we want to download only the index chunk
 	chunks := []types.ChunkRecord{*matchedPin}
 	progressChannel := make(chan *progress.ProgressMsg)
 
