@@ -84,6 +84,21 @@ const (
 	unpublishedGap                            // local scrape gap the manifest does not list
 )
 
+func TestPartitionFreshenResultsStopsAtCancellation(t *testing.T) {
+	results := []index.AppearanceResult{
+		{Range: ranges.FileRange{First: 0, Last: 99}},
+		{Range: ranges.FileRange{First: 100, Last: 199}, Err: index.ErrUserHitControlC},
+		{Range: ranges.FileRange{First: 200, Last: 299}},
+	}
+	keep, err := partitionFreshenResults(results)
+	if !errors.Is(err, index.ErrUserHitControlC) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(keep) != 1 || keep[0].Range.First != 0 {
+		t.Fatalf("keep=%v", keep)
+	}
+}
+
 func TestFreshenMonitorsStopsAtCorruptChunkAndResumes(t *testing.T) {
 	testFreshenStopsAtHole(t, corruptIndexInManifest)
 }

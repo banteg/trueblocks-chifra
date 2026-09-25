@@ -45,7 +45,7 @@ func (chunk *Index) searchForAddressRecord(address base.Address) (int, error) {
 	if searchErr != nil {
 		return -1, searchErr
 	}
-	if pos < 0 || pos >= int(chunk.Header.AddressCount) {
+	if pos >= int(chunk.Header.AddressCount) {
 		return -1, nil
 	}
 

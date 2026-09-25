@@ -181,9 +181,6 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 	jobs, holeErr := updater.stopAtMissingBloom(jobs)
 
 	batchSize := updater.MaxTasks
-	if batchSize < 1 {
-		batchSize = 1
-	}
 	var firstErr error
 	for start := 0; start < len(jobs) && ctx.Err() == nil && firstErr == nil; start += batchSize {
 		end := start + batchSize
@@ -248,11 +245,18 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		}
 	}
 
+	// A chunk interrupted by control+c still stops progress at its range (above), but it
+	// is a cancellation, not a failure.
+	canceled := ctx.Err() != nil || errors.Is(firstErr, index.ErrUserHitControlC)
+	if errors.Is(firstErr, index.ErrUserHitControlC) {
+		firstErr = nil
+	}
+
 	moveErr := updater.moveAllToProduction()
 	if firstErr != nil {
-		return ctx.Err() != nil, firstErr
+		return canceled, firstErr
 	}
-	return ctx.Err() != nil, moveErr
+	return canceled, moveErr
 }
 
 type freshenJob struct {
@@ -423,7 +427,9 @@ func partitionFreshenResults(results []index.AppearanceResult) ([]index.Appearan
 	for _, r := range results {
 		if r.Err != nil {
 			chunkErr := fmt.Errorf("%s: %w", r.Range, r.Err)
-			logger.Error("Error processing index file:", chunkErr)
+			if !errors.Is(r.Err, index.ErrUserHitControlC) {
+				logger.Error("Error processing index file:", chunkErr)
+			}
 			if firstErr == nil || r.Range.First < holeFirst {
 				firstErr = chunkErr
 				holeFirst = r.Range.First

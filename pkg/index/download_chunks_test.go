@@ -211,3 +211,39 @@ func (interruptTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	<-req.Context().Done()
 	return nil, req.Context().Err()
 }
+
+func TestDownloadChunkToDiscStatusRetries(t *testing.T) {
+	origDelay := downloadRetryDelay
+	downloadRetryDelay = time.Millisecond
+	defer func() { downloadRetryDelay = origDelay }()
+
+	tests := []struct {
+		status   int
+		attempts int32
+	}{
+		{http.StatusNotFound, 1},
+		{http.StatusTooManyRequests, 3},
+		{http.StatusBadGateway, 3},
+	}
+	for _, tc := range tests {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			var attempts int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&attempts, 1)
+				w.WriteHeader(tc.status)
+			}))
+			defer server.Close()
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+			chunk := types.ChunkRecord{Range: "000000001-000000002", IndexSize: 64}
+			err := downloadChunkToDisc(context.Background(), "testchain", walk.Index_Final, chunk, server.URL, "fakehash", 3)
+			var statusErr *gatewayStatusError
+			if !errors.As(err, &statusErr) || statusErr.code != tc.status {
+				t.Fatalf("err=%v", err)
+			}
+			if got := atomic.LoadInt32(&attempts); got != tc.attempts {
+				t.Fatalf("attempts=%d, want %d", got, tc.attempts)
+			}
+		})
+	}
+}

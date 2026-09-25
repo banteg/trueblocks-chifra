@@ -128,9 +128,6 @@ type fetchResult struct {
 }
 
 func downloadChunkToDisc(ctx context.Context, chain string, chunkType walk.CacheType, chunk types.ChunkRecord, gateway, hash string, nRetries int) error {
-	if nRetries < 1 {
-		nRetries = 1
-	}
 	delay := downloadRetryDelay
 	var lastErr error
 	for attempt := 1; attempt <= nRetries; attempt++ {
@@ -186,6 +183,10 @@ func downloadAttempt(ctx context.Context, chain string, chunkType walk.CacheType
 }
 
 func retryableDownloadErr(err error) bool {
+	var statusErr *gatewayStatusError
+	if errors.As(err, &statusErr) {
+		return !statusErr.permanent()
+	}
 	return err != nil &&
 		!errors.Is(err, context.Canceled) &&
 		!errors.Is(err, ErrUserHitControlC) &&
@@ -211,6 +212,20 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+type gatewayStatusError struct {
+	url  string
+	code int
+}
+
+func (e *gatewayStatusError) Error() string {
+	return fmt.Sprintf("fetchFromIpfsGateway %s returned status code: %d", e.url, e.code)
+}
+
+// permanent reports client errors (e.g. an unpinned CID) that retrying cannot fix.
+func (e *gatewayStatusError) permanent() bool {
+	return e.code >= 400 && e.code < 500 && e.code != http.StatusRequestTimeout && e.code != http.StatusTooManyRequests
+}
+
 // fetchFromIpfsGateway downloads a chunk from an IPFS gateway using HTTP
 func fetchFromIpfsGateway(ctx context.Context, gateway, hash string) (*fetchResult, error) {
 	url, _ := url.Parse(gateway)
@@ -228,7 +243,7 @@ func fetchFromIpfsGateway(ctx context.Context, gateway, hash string) (*fetchResu
 	}
 	if response.StatusCode != 200 {
 		response.Body.Close()
-		return nil, fmt.Errorf("fetchFromIpfsGateway %s returned status code: %d", url, response.StatusCode)
+		return nil, &gatewayStatusError{url: url.String(), code: response.StatusCode}
 	}
 
 	return &fetchResult{
@@ -297,11 +312,6 @@ func writeReaderToPath(fullPath string, contents io.Reader, expected int64, rng 
 	return writeFileAtomic(fullPath, func(w io.Writer) error {
 		written, err := io.Copy(w, contents)
 		if err != nil {
-			col := colors.Magenta
-			if fullPath == ToIndexPath(fullPath) {
-				col = colors.Yellow
-			}
-			logger.Warn("Failed download", col, rng, colors.Off, strings.Repeat(" ", 30))
 			// Information about this error
 			// https://community.k6.io/t/warn-0040-request-failed-error-stream-error-stream-id-3-internal-error/777/2
 			return fmt.Errorf("error copying %s file in writeBytesToDisc: [%w]", rng, err)
@@ -314,16 +324,11 @@ func writeReaderToPath(fullPath string, contents io.Reader, expected int64, rng 
 }
 
 func expectedChunkSize(chunkType walk.CacheType, res *jobResult) int64 {
-	if res == nil {
-		return 0
+	if chunkType == walk.Index_Bloom && res.theChunk.BloomSize > 0 {
+		return res.theChunk.BloomSize
 	}
-	if res.theChunk != nil {
-		if chunkType == walk.Index_Bloom && res.theChunk.BloomSize > 0 {
-			return res.theChunk.BloomSize
-		}
-		if chunkType != walk.Index_Bloom && res.theChunk.IndexSize > 0 {
-			return res.theChunk.IndexSize
-		}
+	if chunkType != walk.Index_Bloom && res.theChunk.IndexSize > 0 {
+		return res.theChunk.IndexSize
 	}
 	return res.fileSize
 }
