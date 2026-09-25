@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/base"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/config"
@@ -9,11 +10,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/index"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/logger"
+	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/manifest"
 	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/ranges"
+	"github.com/TrueBlocks/trueblocks-chifra/v6/pkg/types"
 )
 
 func TestPartitionFreshenResultsSkipsPastHole(t *testing.T) {
@@ -71,7 +75,32 @@ func TestPartitionFreshenResultsDropsWholeFailedRange(t *testing.T) {
 	}
 }
 
+type freshenHole int
+
+const (
+	corruptIndexInManifest freshenHole = iota // restorable, so quarantined
+	corruptIndexNoManifest                    // not restorable, so left in place
+	missingBloom                              // published chunk failed to download
+	unpublishedGap                            // local scrape gap the manifest does not list
+)
+
 func TestFreshenMonitorsStopsAtCorruptChunkAndResumes(t *testing.T) {
+	testFreshenStopsAtHole(t, corruptIndexInManifest)
+}
+
+func TestFreshenMonitorsKeepsCorruptChunkWithoutManifest(t *testing.T) {
+	testFreshenStopsAtHole(t, corruptIndexNoManifest)
+}
+
+func TestFreshenMonitorsStopsAtMissingBloom(t *testing.T) {
+	testFreshenStopsAtHole(t, missingBloom)
+}
+
+func TestFreshenMonitorsAllowsUnpublishedGap(t *testing.T) {
+	testFreshenStopsAtHole(t, unpublishedGap)
+}
+
+func testFreshenStopsAtHole(t *testing.T, hole freshenHole) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	const chain = "testchain"
 	address := base.HexToAddress("0x1234567890123456789012345678901234567890")
@@ -108,8 +137,31 @@ func TestFreshenMonitorsStopsAtCorruptChunkAndResumes(t *testing.T) {
 	writeChunk(0)
 	broken := writeChunk(100)
 	writeChunk(200)
-	if err := os.Truncate(broken, index.HeaderWidth); err != nil {
-		t.Fatal(err)
+	if hole == corruptIndexInManifest || hole == missingBloom {
+		man := manifest.Manifest{Chain: chain}
+		for _, rng := range []string{"000000000-000000099", "000000100-000000199", "000000200-000000299"} {
+			man.Chunks = append(man.Chunks, types.ChunkRecord{Range: rng, IndexHash: "fakehash"})
+		}
+		manBytes, err := json.Marshal(man)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(config.PathToManifestFile(chain), manBytes, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	switch hole {
+	case corruptIndexInManifest, corruptIndexNoManifest:
+		if err := os.Truncate(broken, index.HeaderWidth); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		if err := os.Remove(index.ToBloomPath(broken)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(broken); err != nil {
+			t.Fatal(err)
+		}
 	}
 	freshen := func() error {
 		updater := NewUpdater(chain, true, false, []string{address.Hex()})
@@ -132,16 +184,79 @@ func TestFreshenMonitorsStopsAtCorruptChunkAndResumes(t *testing.T) {
 			t.Fatalf("lastScanned=%d count=%d, want %d %d", mon.LastScanned, mon.Count(), last, count)
 		}
 	}
-	if err := freshen(); !errors.Is(err, index.ErrCorruptIndex) {
+	err := freshen()
+	if hole == unpublishedGap {
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkMonitor(300, 2)
+		return
+	}
+	if hole == missingBloom && (err == nil || !strings.Contains(err.Error(), "missing bloom filter for published chunk 000000100-000000199")) {
+		t.Fatalf("expected missing bloom error, got %v", err)
+	}
+	if hole != missingBloom && !errors.Is(err, index.ErrCorruptIndex) {
 		t.Fatalf("expected corruption error, got %v", err)
 	}
 	checkMonitor(100, 1)
-	if _, err := os.Stat(broken + ".corrupt"); err != nil {
-		t.Fatalf("missing quarantined chunk: %v", err)
+	_, quarantineErr := os.Stat(broken + ".corrupt")
+	_, brokenErr := os.Stat(broken)
+	if hole == corruptIndexInManifest && (quarantineErr != nil || brokenErr == nil) {
+		t.Fatalf("expected chunk quarantined: %v %v", quarantineErr, brokenErr)
+	}
+	if hole == corruptIndexNoManifest && (quarantineErr == nil || brokenErr != nil) {
+		t.Fatalf("expected chunk left in place: %v %v", quarantineErr, brokenErr)
 	}
 	writeChunk(100)
 	if err := freshen(); err != nil {
 		t.Fatal(err)
 	}
 	checkMonitor(300, 3)
+}
+
+func TestStopAtMissingBloom(t *testing.T) {
+	rng := func(first, last base.Blknum) ranges.FileRange { return ranges.FileRange{First: first, Last: last} }
+	tests := []struct {
+		name      string
+		published []string
+		local     []ranges.FileRange
+		keep      int
+		wantErr   string
+	}{
+		{"nested stale bloom covers range", []string{"000000200-000000299"}, []ranges.FileRange{rng(0, 299), rng(100, 199), rng(300, 399)}, 3, ""},
+		{"missing published chunk", []string{"000000100-000000199"}, []ranges.FileRange{rng(0, 99), rng(200, 299)}, 1, "missing bloom filter for published chunk 000000100-000000199"},
+		{"malformed manifest range", []string{"000000100-bad"}, []ranges.FileRange{rng(0, 99), rng(200, 299)}, 0, `malformed manifest range "000000100-bad"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			const chain = "testchain"
+			man := manifest.Manifest{Chain: chain}
+			for _, r := range tc.published {
+				man.Chunks = append(man.Chunks, types.ChunkRecord{Range: r})
+			}
+			manBytes, err := json.Marshal(man)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(config.PathToIndex(chain), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(config.PathToManifestFile(chain), manBytes, 0600); err != nil {
+				t.Fatal(err)
+			}
+			jobs := make([]freshenJob, 0, len(tc.local))
+			for _, r := range tc.local {
+				jobs = append(jobs, freshenJob{rng: r})
+			}
+			updater := MonitorUpdate{Chain: chain, FirstBlock: 100}
+			kept, err := updater.stopAtMissingBloom(jobs)
+			if (err == nil) != (tc.wantErr == "") || (err != nil && err.Error() != tc.wantErr) {
+				t.Fatalf("err=%v, want %q", err, tc.wantErr)
+			}
+			if len(kept) != tc.keep {
+				t.Fatalf("kept %d jobs, want %d", len(kept), tc.keep)
+			}
+		})
+	}
 }

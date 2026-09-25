@@ -56,6 +56,20 @@ func TestWriteReaderToPathRejectsConcurrentTruncation(t *testing.T) {
 	}
 }
 
+func TestWriteReaderToPathPublishesReadableFile(t *testing.T) {
+	full := filepath.Join(t.TempDir(), "000000001-000000002.bin")
+	if err := writeReaderToPath(full, bytes.NewReader([]byte("abc")), 3, "x"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0644 {
+		t.Fatalf("mode=%v", info.Mode().Perm())
+	}
+}
+
 func TestWriteReaderToPathMissingSize(t *testing.T) {
 	err := writeReaderToPath(filepath.Join(t.TempDir(), "x.bin"), bytes.NewReader([]byte("abc")), 0, "x")
 	if !errors.Is(err, ErrMissingSize) {
@@ -64,26 +78,27 @@ func TestWriteReaderToPathMissingSize(t *testing.T) {
 }
 
 func TestDownloadChunkToDiscRetries(t *testing.T) {
-	origDelay := downloadRetryDelay
+	origDelay, origStall := downloadRetryDelay, downloadStallTimeout
 	downloadRetryDelay = 5 * time.Millisecond
-	defer func() { downloadRetryDelay = origDelay }()
+	downloadStallTimeout = 100 * time.Millisecond
+	defer func() { downloadRetryDelay, downloadStallTimeout = origDelay, origStall }()
 
 	finalBytes := bytes.Repeat([]byte("z"), 64)
 
 	tests := []struct {
 		name       string
-		firstServe func(w http.ResponseWriter)
+		firstServe func(w http.ResponseWriter, r *http.Request)
 	}{
 		{
 			name: "body smaller than manifest size",
-			firstServe: func(w http.ResponseWriter) {
+			firstServe: func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write(finalBytes[:32])
 			},
 		},
 		{
 			name: "body interrupted before Content-Length",
-			firstServe: func(w http.ResponseWriter) {
+			firstServe: func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(finalBytes)))
 				w.WriteHeader(http.StatusOK)
 				if flusher, ok := w.(http.Flusher); ok {
@@ -91,6 +106,16 @@ func TestDownloadChunkToDiscRetries(t *testing.T) {
 					flusher.Flush()
 				}
 				// Close connection ungracefully via panic/hijack or by returning with fewer bytes
+			},
+		},
+		{
+			name: "gateway stalls mid-body",
+			firstServe: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(finalBytes)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(finalBytes[:16])
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
 			},
 		},
 	}
@@ -101,7 +126,7 @@ func TestDownloadChunkToDiscRetries(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				att := atomic.AddInt32(&attempts, 1)
 				if att == 1 {
-					tc.firstServe(w)
+					tc.firstServe(w, r)
 					return
 				}
 				w.WriteHeader(http.StatusOK)

@@ -133,10 +133,6 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		return ctx.Err() != nil, err
 	}
 
-	type freshenJob struct {
-		fileName string
-		rng      ranges.FileRange
-	}
 	jobs := make([]freshenJob, 0, len(files))
 	for _, info := range files {
 		if ctx.Err() != nil {
@@ -182,6 +178,8 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		return jobs[i].rng.Last < jobs[j].rng.Last
 	})
 
+	jobs, holeErr := updater.stopAtMissingBloom(jobs)
+
 	batchSize := updater.MaxTasks
 	if batchSize < 1 {
 		batchSize = 1
@@ -210,6 +208,9 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 			updater.updateMonitors(&keep[i])
 		}
 		firstErr = err
+	}
+	if firstErr == nil && ctx.Err() == nil {
+		firstErr = holeErr
 	}
 
 	if firstErr == nil && ctx.Err() == nil && !updater.TestMode {
@@ -252,6 +253,59 @@ func (updater *MonitorUpdate) FreshenMonitors(monitorArray *[]Monitor) (bool, er
 		return ctx.Err() != nil, firstErr
 	}
 	return ctx.Err() != nil, moveErr
+}
+
+type freshenJob struct {
+	fileName string
+	rng      ranges.FileRange
+}
+
+// stopAtMissingBloom drops the (sorted) jobs from the first published chunk that has no bloom
+// on disc. Freshen only sees blooms that exist, so a failed download would otherwise let
+// LastScanned skip that range. Gaps between locally scraped chunks can be legitimate, so
+// only the local manifest decides what should be present.
+func (updater *MonitorUpdate) stopAtMissingBloom(jobs []freshenJob) ([]freshenJob, error) {
+	if len(jobs) == 0 || !file.FileExists(config.PathToManifestFile(updater.Chain)) {
+		return jobs, nil
+	}
+	man, err := manifest.LoadManifest(updater.Chain, updater.PublisherAddr, manifest.LocalCache)
+	if err != nil {
+		return nil, err
+	}
+
+	// maxLast[i] is the furthest block covered by jobs[:i+1], so nested or overlapping
+	// stale blooms still count as coverage.
+	maxLast := make([]base.Blknum, len(jobs))
+	for i, job := range jobs {
+		maxLast[i] = job.rng.Last
+		if i > 0 {
+			maxLast[i] = max(maxLast[i], maxLast[i-1])
+		}
+	}
+
+	last := jobs[len(jobs)-1].rng
+	missing := ranges.FileRange{First: base.NOPOSN, Last: base.NOPOSN}
+	for _, chunk := range man.Chunks {
+		rng := ranges.RangeFromRangeString(chunk.Range)
+		// The parser is lenient; a misread range could hide a hole, so require a round trip.
+		if rng.String() != chunk.Range || rng.First > rng.Last {
+			return nil, fmt.Errorf("malformed manifest range %q", chunk.Range)
+		}
+		if rng.EarlierThanB(updater.FirstBlock) || rng.First > last.First || rng.First >= missing.First {
+			continue
+		}
+		// Present if any local bloom overlaps it (local chunk boundaries may differ).
+		n := sort.Search(len(jobs), func(i int) bool { return jobs[i].rng.First > rng.Last })
+		if n == 0 || maxLast[n-1] < rng.First {
+			missing = rng
+		}
+	}
+	if missing.First == base.NOPOSN {
+		return jobs, nil
+	}
+
+	n := sort.Search(len(jobs), func(i int) bool { return jobs[i].rng.First > missing.First })
+	return jobs[:n], fmt.Errorf("missing bloom filter for published chunk %s", missing)
 }
 
 // visitChunkToFreshenFinal opens an index file, searches for the address(es) we're looking for and pushes
@@ -319,10 +373,7 @@ func (updater *MonitorUpdate) visitChunkToFreshenFinal(fileName string, resultCh
 	indexChunk, err := index.OpenIndex(indexFilename, true /* check */)
 	if err != nil {
 		if errors.Is(err, index.ErrCorruptIndex) {
-			corruptName := indexFilename + ".corrupt"
-			if renErr := os.Rename(indexFilename, corruptName); renErr != nil && !os.IsNotExist(renErr) {
-				logger.Error("failed to quarantine corrupt index", indexFilename, renErr)
-			}
+			updater.quarantineCorruptIndex(indexFilename, bl.Range)
 		}
 		results = append(results, index.AppearanceResult{Range: bl.Range, Err: err})
 		return
@@ -332,6 +383,28 @@ func (updater *MonitorUpdate) visitChunkToFreshenFinal(fileName string, resultCh
 
 	for _, mon := range updater.MonitorMap {
 		results = append(results, *indexChunk.ReadAppearances(mon.Address))
+	}
+}
+
+// quarantineCorruptIndex moves a corrupt index aside so a later run downloads it again.
+// Chunks the manifest cannot restore (for example, ones scraped locally) stay in place.
+func (updater *MonitorUpdate) quarantineCorruptIndex(indexFilename string, rng ranges.FileRange) {
+	// LoadManifest falls back to the network when there is no local copy; stay local here.
+	if !file.FileExists(config.PathToManifestFile(updater.Chain)) {
+		logger.Warn("not quarantining corrupt index, no local manifest:", indexFilename)
+		return
+	}
+	man, err := manifest.LoadManifest(updater.Chain, updater.PublisherAddr, manifest.LocalCache)
+	if err != nil {
+		logger.Warn("not quarantining corrupt index, manifest unavailable:", indexFilename, err)
+		return
+	}
+	if pin := man.ChunkMap[rng.String()]; pin == nil || pin.IndexHash == "" {
+		logger.Warn("not quarantining corrupt index missing from manifest:", indexFilename)
+		return
+	}
+	if err := os.Rename(indexFilename, indexFilename+".corrupt"); err != nil && !os.IsNotExist(err) {
+		logger.Error("failed to quarantine corrupt index", indexFilename, err)
 	}
 }
 

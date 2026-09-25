@@ -49,6 +49,7 @@ var ErrUserHitControlC = errors.New("user hit control + c")
 var ErrDownloadError = errors.New("download error")
 var ErrSizeMismatch = errors.New("downloaded chunk size mismatch")
 var ErrMissingSize = errors.New("missing expected chunk size")
+var ErrDownloadStalled = errors.New("download stalled")
 
 // WorkerArguments are types meant to hold worker function arguments. We cannot
 // pass the arguments directly, because a worker function is expected to take one
@@ -106,7 +107,7 @@ func getDownloadWorker(chain string, workerArgs downloadWorkerArguments, chunkTy
 				progressChannel <- &progress.ProgressMsg{
 					Payload: &chunk,
 					Event:   progress.Error,
-					Error:   fmt.Errorf("%w [%s]", ErrDownloadError, err.Error()),
+					Error:   fmt.Errorf("%w: %w", ErrDownloadError, err),
 				}
 				return
 			}
@@ -136,20 +137,7 @@ func downloadChunkToDisc(ctx context.Context, chain string, chunkType walk.Cache
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := func() error {
-			download, err := fetchFromIpfsGateway(ctx, gateway, hash)
-			if err != nil {
-				return err
-			}
-			defer download.Body.Close()
-			res := &jobResult{
-				rng:      chunk.Range,
-				fileSize: download.ContentLen,
-				contents: download.Body,
-				theChunk: &chunk,
-			}
-			return writeBytesToDisc(chain, chunkType, res)
-		}()
+		err := downloadAttempt(ctx, chain, chunkType, chunk, gateway, hash)
 		if err == nil {
 			return nil
 		}
@@ -170,6 +158,33 @@ func downloadChunkToDisc(ctx context.Context, chain string, chunkType walk.Cache
 	return lastErr
 }
 
+// downloadAttempt fetches one chunk and publishes it. The stall timer runs only while
+// waiting on the gateway (headers, then each body read), so a gateway that stops sending
+// fails the attempt instead of hanging it, while slow disk writes are not counted.
+func downloadAttempt(ctx context.Context, chain string, chunkType walk.CacheType, chunk types.ChunkRecord, gateway, hash string) error {
+	attemptCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stall := time.AfterFunc(downloadStallTimeout, func() { cancel(ErrDownloadStalled) })
+	defer stall.Stop()
+
+	download, err := fetchFromIpfsGateway(attemptCtx, gateway, hash)
+	stall.Stop()
+	if err == nil {
+		defer download.Body.Close()
+		err = writeBytesToDisc(chain, chunkType, &jobResult{
+			rng:      chunk.Range,
+			fileSize: download.ContentLen,
+			contents: &stallReader{r: download.Body, timer: stall, timeout: downloadStallTimeout},
+			theChunk: &chunk,
+		})
+	}
+	stalled := ctx.Err() == nil && errors.Is(context.Cause(attemptCtx), ErrDownloadStalled)
+	if stalled && (errors.Is(err, context.Canceled) || errors.Is(err, ErrDownloadStalled)) {
+		return fmt.Errorf("%w for %s: no data for %s", ErrDownloadStalled, chunk.Range, downloadStallTimeout)
+	}
+	return err
+}
+
 func retryableDownloadErr(err error) bool {
 	return err != nil &&
 		!errors.Is(err, context.Canceled) &&
@@ -180,6 +195,21 @@ func retryableDownloadErr(err error) bool {
 }
 
 var downloadRetryDelay = time.Second
+var downloadStallTimeout = time.Minute
+
+// stallReader arms timer for the duration of each read so only an idle gateway trips it.
+type stallReader struct {
+	r       io.Reader
+	timer   *time.Timer
+	timeout time.Duration
+}
+
+func (s *stallReader) Read(p []byte) (int, error) {
+	s.timer.Reset(s.timeout)
+	n, err := s.r.Read(p)
+	s.timer.Stop()
+	return n, err
+}
 
 // fetchFromIpfsGateway downloads a chunk from an IPFS gateway using HTTP
 func fetchFromIpfsGateway(ctx context.Context, gateway, hash string) (*fetchResult, error) {
@@ -264,35 +294,23 @@ func writeReaderToPath(fullPath string, contents io.Reader, expected int64, rng 
 		return err
 	}
 
-	outputFile, err := os.CreateTemp(filepath.Dir(fullPath), filepath.Base(fullPath)+".download-*.tmp")
-	if err != nil {
-		return fmt.Errorf("error creating download temp file for %s in writeBytesToDisc: [%w]", rng, err)
-	}
-	tmpPath := outputFile.Name()
-	defer os.Remove(tmpPath)
-
-	written, err := io.Copy(outputFile, contents)
-	closeErr := outputFile.Close()
-	if err != nil {
-		col := colors.Magenta
-		if fullPath == ToIndexPath(fullPath) {
-			col = colors.Yellow
+	return writeFileAtomic(fullPath, func(w io.Writer) error {
+		written, err := io.Copy(w, contents)
+		if err != nil {
+			col := colors.Magenta
+			if fullPath == ToIndexPath(fullPath) {
+				col = colors.Yellow
+			}
+			logger.Warn("Failed download", col, rng, colors.Off, strings.Repeat(" ", 30))
+			// Information about this error
+			// https://community.k6.io/t/warn-0040-request-failed-error-stream-error-stream-id-3-internal-error/777/2
+			return fmt.Errorf("error copying %s file in writeBytesToDisc: [%w]", rng, err)
 		}
-		logger.Warn("Failed download", col, rng, colors.Off, strings.Repeat(" ", 30))
-		// Information about this error
-		// https://community.k6.io/t/warn-0040-request-failed-error-stream-error-stream-id-3-internal-error/777/2
-		return fmt.Errorf("error copying %s file in writeBytesToDisc: [%w]", rng, err)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("error closing %s file in writeBytesToDisc: [%w]", rng, closeErr)
-	}
-	if written != expected {
-		return fmt.Errorf("%w for %s: wrote %d, expected %d", ErrSizeMismatch, rng, written, expected)
-	}
-	if err := os.Rename(tmpPath, fullPath); err != nil {
-		return fmt.Errorf("error renaming %s file in writeBytesToDisc: [%w]", rng, err)
-	}
-	return nil
+		if written != expected {
+			return fmt.Errorf("%w for %s: wrote %d, expected %d", ErrSizeMismatch, rng, written, expected)
+		}
+		return nil
+	})
 }
 
 func expectedChunkSize(chunkType walk.CacheType, res *jobResult) int64 {
